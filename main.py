@@ -1,19 +1,32 @@
 import os
-# Turn off oneDNN optimizations for deterministic TensorFlow results
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+# ─── Turn off oneDNN and enable deterministic ops ───
+os.environ['TF_ENABLE_ONEDNN_OPTS']  = '0'
+os.environ['TF_DETERMINISTIC_OPS']    = '1'
+os.environ['TF_CUDNN_DETERMINISM']    = '1'
+os.environ['PYTHONHASHSEED']          = '0'
 
+import random
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+
+# ─── Global seed ───
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 # === Statistical & ML imports ===
 from sklearn.decomposition import PCA               # extract orthogonal factors from returns
 from statsmodels.tsa.stattools import coint         # cointegration test for mean-reversion signals
-from tensorflow.keras.models import Sequential      # sequential model API
-from tensorflow.keras.layers import Input, LSTM, Dense  # define LSTM architecture
-from tensorflow.keras.optimizers import Adam        # adaptive gradient optimizer
+
+# ─── Now your Keras imports ───
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, Dense
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.initializers import GlorotUniform, Zeros
 
 
-defindent = ''
 # === DATA HANDLING ===
 class DataHandler:
     """
@@ -47,7 +60,10 @@ class FeatureEngineer:
 
     def compute_pca_signals(self, n_components=3) -> pd.DataFrame:
         # fit PCA on returns to extract top factors
-        vals = PCA(n_components=n_components).fit_transform(self.data.returns.values)
+        pca = PCA(n_components=n_components,
+                  svd_solver='full',  # deterministic solver
+                  random_state=SEED)  # if you ever use randomized SVD
+        vals = pca.fit_transform(self.data.returns.values)
         cols = [f"PC{i+1}" for i in range(n_components)]
         # align PC time series with original dates
         return pd.DataFrame(vals, index=self.data.returns.index, columns=cols)
@@ -121,8 +137,15 @@ class LSTMAlphaModel:
         # explicit Input layer to satisfy Keras best practices
         self.model = Sequential([
             Input(shape=(self.lookback, len(self.features))),
-            LSTM(64, name="lstm_layer"),        # capture temporal dependencies
-            Dense(self.n_assets, name="output_layer")  # one output per asset
+            LSTM(64,
+                 name="lstm_layer",     # capture temporal dependencies
+                 kernel_initializer=GlorotUniform(seed=SEED),
+                 recurrent_initializer=GlorotUniform(seed=SEED),
+                 bias_initializer=Zeros()),
+            Dense(self.n_assets,
+                  name="output_layer",          # one output per asset
+                  kernel_initializer=GlorotUniform(seed=SEED),
+                  bias_initializer=Zeros())
         ])
         # Adam optimizer balances speed and stability
         self.model.compile(optimizer=Adam(1e-3), loss='mse')
@@ -289,6 +312,64 @@ if __name__ == '__main__':
     plt.title('Strategy vs Benchmark')
     plt.xlabel('Date')
     plt.ylabel('Portfolio Value')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # 7) Compute equal‐weight returns series
+    eq_returns = eq_val.pct_change().fillna(0)
+
+    # 8) Bar‐chart comparison of Total Return & Sharpe
+    import matplotlib.pyplot as plt
+    metrics = pd.DataFrame({
+        'Enhanced Stat-Arb': [strat_stats['Total Return'], strat_stats['Sharpe']],
+        'Equal-Weight'    : [       eq_stats['Total Return'],        eq_stats['Sharpe']]
+    }, index=['Total Return', 'Sharpe'])
+    # transpose so each strategy is a group
+    metrics.T.plot(kind='bar', subplots=True,
+                   layout=(1,2), figsize=(12,4),
+                   title=['Total Return','Sharpe Ratio'], legend=False)
+    plt.tight_layout()
+    plt.show()
+
+
+    # 9) 60-day rolling Sharpe ratio
+    rolling_window = 60
+    roll_sharpe_strat = (
+        strat_df['Returns']
+        .rolling(rolling_window)
+        .mean() /
+        strat_df['Returns']
+        .rolling(rolling_window)
+        .std()
+    ) * np.sqrt(252)
+    roll_sharpe_eq = (
+        eq_returns
+        .rolling(rolling_window)
+        .mean() /
+        eq_returns
+        .rolling(rolling_window)
+        .std()
+    ) * np.sqrt(252)
+
+    plt.figure(figsize=(10,5))
+    roll_sharpe_strat.plot(label='Stat-Arb Rolling Sharpe')
+    roll_sharpe_eq.plot(label='Equal-Weight Rolling Sharpe')
+    plt.axhline(0, color='black', lw=0.5)
+    plt.title(f'{rolling_window}-Day Rolling Sharpe Ratio')
+    plt.xlabel('Date')
+    plt.ylabel('Sharpe')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # 10) Distribution of daily returns
+    plt.figure(figsize=(10,5))
+    strat_df['Returns'].hist(bins=50, alpha=0.6, label='Stat-Arb')
+    eq_returns.hist(bins=50, alpha=0.4, label='Equal-Weight')
+    plt.title('Histogram of Daily Returns')
+    plt.xlabel('Daily Return')
+    plt.ylabel('Frequency')
     plt.legend()
     plt.tight_layout()
     plt.show()
