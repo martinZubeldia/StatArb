@@ -1,30 +1,40 @@
 import os
+
 # ─── Turn off oneDNN and enable deterministic ops ───
-os.environ['TF_ENABLE_ONEDNN_OPTS']  = '0'
-os.environ['TF_DETERMINISTIC_OPS']    = '1'
-os.environ['TF_CUDNN_DETERMINISM']    = '1'
-os.environ['PYTHONHASHSEED']          = '0'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+os.environ['TF_CUDNN_DETERMINISM'] = '1'
+os.environ['PYTHONHASHSEED'] = '0'
+
 
 import random
 import numpy as np
 import pandas as pd
+
+# === Statistical & ML imports ===
 import tensorflow as tf
+from sklearn.decomposition import PCA  # extract orthogonal factors from returns
+from statsmodels.tsa.stattools import coint  # cointegration test for mean-reversion signals
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.initializers import GlorotUniform, Zeros
+from tensorflow.keras.callbacks import EarlyStopping
 
 # ─── Global seed ───
-SEED = 42
+SEED = 70
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# === Statistical & ML imports ===
-from sklearn.decomposition import PCA               # extract orthogonal factors from returns
-from statsmodels.tsa.stattools import coint         # cointegration test for mean-reversion signals
+# Pairwise ranking loss
+def pairwise_ranking_loss(y_true, y_pred):
+    diffs = tf.expand_dims(y_pred, -1) - tf.expand_dims(y_pred, -2)
+    true_diffs = tf.expand_dims(y_true, -1) - tf.expand_dims(y_true, -2)
+    signs = tf.sign(true_diffs)
+    loss = tf.nn.relu(1.0 - signs * diffs)
+    return tf.reduce_mean(loss)
 
-# ─── Now your Keras imports ───
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, LSTM, Dense
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.initializers import GlorotUniform, Zeros
 
 
 # === DATA HANDLING ===
@@ -36,6 +46,7 @@ class DataHandler:
     - Computes simple daily percent-change returns for modeling.
     - Optionally stores volume for later impact calculations.
     """
+
     def __init__(self, price_df: pd.DataFrame, volume_df: pd.DataFrame = None):
         # sort_index() ensures data is in ascending time order
         self.prices = price_df.sort_index()
@@ -55,6 +66,7 @@ class FeatureEngineer:
       4. Volatility estimates risk for position sizing.
       5. Spread z-scores quantify deviation from equilibrium.
     """
+
     def __init__(self, data: DataHandler):
         self.data = data
 
@@ -64,7 +76,7 @@ class FeatureEngineer:
                   svd_solver='full',  # deterministic solver
                   random_state=SEED)  # if you ever use randomized SVD
         vals = pca.fit_transform(self.data.returns.values)
-        cols = [f"PC{i+1}" for i in range(n_components)]
+        cols = [f"PC{i + 1}" for i in range(n_components)]
         # align PC time series with original dates
         return pd.DataFrame(vals, index=self.data.returns.index, columns=cols)
 
@@ -73,7 +85,7 @@ class FeatureEngineer:
         assets = self.data.prices.columns
         pairs = []
         for i in range(len(assets)):
-            for j in range(i+1, len(assets)):
+            for j in range(i + 1, len(assets)):
                 a, b = assets[i], assets[j]
                 # Engle-Granger: returns (t_stat, p_value, crit_vals)
                 _, p_value, _ = coint(self.data.prices[a], self.data.prices[b])
@@ -103,6 +115,27 @@ class FeatureEngineer:
         # drop initial rows with NaNs
         return z.dropna()
 
+    def compute_technical_indicators(self) -> pd.DataFrame:
+        # Compute simple moving averages and returns
+        sma_10 = self.data.prices.rolling(window=10).mean()
+        sma_50 = self.data.prices.rolling(window=50).mean()
+        rsi = 100 - 100 / (1 + self.data.returns.rolling(14).mean() / self.data.returns.rolling(14).std())
+        momentum_10 = self.data.prices.pct_change(periods=10).shift(1)
+        sma_diff = sma_10 - sma_50
+        return pd.concat([sma_diff, rsi, momentum_10], axis=1, keys=['sma_diff', 'rsi', 'momentum'])
+
+    def compute_macro_features(self, tickers_df: pd.DataFrame) -> pd.DataFrame:
+        spy = tickers_df['SPY']
+        vix = tickers_df['VIXY']
+        spy_ret = spy.pct_change().rename('SPY_ret')
+        vix_ret = vix.pct_change().rename('VIX_ret')
+
+        sector_etfs = ['XLF', 'XLK', 'XLE', 'XLV', 'XLY', 'XLP', 'XLU', 'IWM']
+        sector_ret = tickers_df[sector_etfs].pct_change()
+        dispersion = sector_ret.std(axis=1).rename('sector_dispersion')
+
+        return pd.concat([spy_ret, vix_ret, dispersion], axis=1)
+
 
 # === LSTM PREDICTION MODEL ===
 class LSTMAlphaModel:
@@ -113,6 +146,7 @@ class LSTMAlphaModel:
     - Architecture: Input -> LSTM(64 units) -> Dense(n_assets).
     - Loss: MSE between predicted and actual returns.
     """
+
     def __init__(self, lookback=20, features=None, asset_names=None):
         self.lookback = lookback
         self.features = features or []
@@ -128,7 +162,7 @@ class LSTMAlphaModel:
         tgt_arr = target_df.values
         for idx in range(self.lookback, len(data_arr)):
             # sequence of past `lookback` steps
-            X.append(data_arr[idx-self.lookback:idx])
+            X.append(data_arr[idx - self.lookback:idx])
             # next-day target vector
             Y.append(tgt_arr[idx])
         return np.array(X), np.array(Y)
@@ -138,25 +172,38 @@ class LSTMAlphaModel:
         self.model = Sequential([
             Input(shape=(self.lookback, len(self.features))),
             LSTM(64,
-                 name="lstm_layer",     # capture temporal dependencies
+                 name="lstm_layer",  # capture temporal dependencies
                  kernel_initializer=GlorotUniform(seed=SEED),
                  recurrent_initializer=GlorotUniform(seed=SEED),
                  bias_initializer=Zeros()),
             Dense(self.n_assets,
-                  name="output_layer",          # one output per asset
+                  name="output_layer",  # one output per asset
                   kernel_initializer=GlorotUniform(seed=SEED),
                   bias_initializer=Zeros())
         ])
         # Adam optimizer balances speed and stability
-        self.model.compile(optimizer=Adam(1e-3), loss='mse')
+        self.model.compile(optimizer=Adam(1e-3), loss=pairwise_ranking_loss)
 
     def train(self, feat_df: pd.DataFrame, target_df: pd.DataFrame,
-              epochs=20, batch_size=32):
+              epochs=100, batch_size=32):
         # prepare inputs and outputs
         X, Y = self.prepare_sequences(feat_df, target_df)
+        # Normalize features
+        X_mean = X.mean(axis=(0, 1), keepdims=True)
+        X_std = X.std(axis=(0, 1), keepdims=True)
+        X = (X - X_mean) / X_std
         self.build_model()
         # verbose=2 prints one line per epoch
-        self.model.fit(X, Y, epochs=epochs, batch_size=batch_size, verbose=2)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        self.model.fit(
+            X, Y,
+            validation_split=0.2,
+            epochs=epochs,
+            batch_size=batch_size,
+            shuffle=False,
+            callbacks=[early_stopping],
+            verbose=0
+        )
 
     def predict(self, feat_df: pd.DataFrame) -> pd.DataFrame:
         # create dummy target for correct shaping
@@ -181,14 +228,15 @@ class Backtester:
       - weekly rebalancing on Mondays
       - inverse-volatility position sizing
     """
+
     def __init__(
-        self,
-        prices: pd.DataFrame,
-        volumes: pd.DataFrame = None,
-        spread_pct: float = 0.001,
-        impact_coeff: float = 1e-3,
-        init_cash: float = 1e6,
-        adv_window: int = 20
+            self,
+            prices: pd.DataFrame,
+            volumes: pd.DataFrame = None,
+            spread_pct: float = 0.001,
+            impact_coeff: float = 1e-3,
+            init_cash: float = 1e6,
+            adv_window: int = 20
     ):
         # sorted price series
         self.prices = prices.sort_index()
@@ -242,7 +290,8 @@ class Backtester:
                 if abs(sig_val) < threshold:
                     continue
                 # allocate cash proportionally and directionally
-                alloc = self.cash_series.at[date] * inv_vol[asset] * np.sign(sig_val)
+                raw_alloc = self.cash_series.at[date] * inv_vol[asset] * sig_val
+                alloc = np.clip(raw_alloc, -0.05 * self.cash_series.at[date], 0.05 * self.cash_series.at[date])
                 self.execute_order(asset, date, alloc)
         return self.performance()
 
@@ -263,113 +312,87 @@ class Backtester:
 if __name__ == '__main__':
     import yfinance as yf
     import matplotlib.pyplot as plt
+    import pandas as pd
 
     # 1) Data download for a basket of tech tickers
-    tickers = ['AAPL','AMZN','MSFT','GOOG','NVDA','TSLA','META','AMD','INTC']
-    raw = yf.download(tickers, start='2020-01-01', end='2025-05-01')
+    tickers = ['AAPL', 'AMZN', 'MSFT', 'GOOG', 'NVDA', 'TSLA', 'META', 'AMD', 'INTC', 'NFLX', 'ADBE', 'SPY', 'VIXY',
+               'XLF', 'XLK', 'XLE', 'XLV', 'XLY', 'XLP', 'XLU', 'IWM']
+    raw = yf.download(tickers, start='2023-01-01', end='2024-12-31')
     price = raw['Close']
     volume = raw['Volume']
 
     # 2) Initialize handlers and engineer features
-    dh = DataHandler(price, volume)              # load and preprocess data
-    fe = FeatureEngineer(dh)                      # feature factory
-    pca = fe.compute_pca_signals(3)              # top-3 principal components
-    pairs = fe.find_cointegrated_pairs()         # identify mean-reverting pairs
-    mom = fe.compute_momentum(5)                 # 5-day momentum signals
-    vol_est = fe.compute_volatility(20)          # 20-day rolling volatility
+    dh = DataHandler(price, volume)  # load and preprocess data
+    fe = FeatureEngineer(dh)  # feature factory
+    pca = fe.compute_pca_signals(5)  # top-3 principal components
+    pairs = fe.find_cointegrated_pairs()  # identify mean-reverting pairs
+    mom = fe.compute_momentum(5)  # 5-day momentum signals
+    vol_est = fe.compute_volatility(20)  # 20-day rolling volatility
     spread_z = fe.compute_spread_zscores(pairs[:3], 20)  # z-scores for top pairs
-    # join signals on common dates
-    signals = pd.concat([pca, mom, spread_z], axis=1).dropna()
+    tech = fe.compute_technical_indicators()
+    signals = pd.concat([pca, mom, spread_z, tech], axis=1).dropna()
+    target = dh.returns.loc[signals.index].rank(axis=1, pct=True) * 2 - 1  # true next-day returns
+    vol_est = vol_est.loc[signals.index]
+
+    # ---- Split data into train and test by date ----
+    split_date = pd.Timestamp('2024-01-01')
+    train_signals = signals.loc[:split_date]
+    train_target = target.loc[:split_date]
+    test_signals = signals.loc[split_date:]
+    test_vol = vol_est.loc[split_date:]
+    test_prices = price.loc[test_signals.index]
 
     # 3) Train LSTM alpha model to forecast next-day returns
-    target = dh.returns.loc[signals.index]       # true next-day returns
     alpha_model = LSTMAlphaModel(
         lookback=20,
         features=signals.columns.tolist(),
         asset_names=target.columns.tolist()
     )
-    alpha_model.train(signals, target, epochs=10)    # fit model
-    alpha_signals = alpha_model.predict(signals)    # generate forecasts
+    alpha_model.train(train_signals, train_target, epochs=100)  # fit model
+    alpha_signals_test = alpha_model.predict(test_signals)  # generate forecasts
+
+    # Smooth predictions before backtest
+    alpha_signals_test = alpha_signals_test.ewm(span=3).mean()
 
     # 4) Backtest strategy with event-driven engine
-    bt = Backtester(price.loc[signals.index], volume.loc[signals.index])
-    strat_df, strat_stats = bt.run_backtest(alpha_signals, vol_est, threshold=0.01)
+    bt = Backtester(price.loc[test_signals.index], volume.loc[test_signals.index])
+    strat_df, strat_stats = bt.run_backtest(alpha_signals_test, test_vol, threshold=0.01)
 
-    # 5) Compare to equal-weight benchmark
+    # 6) Equal‐Weight Benchmark on TEST data
     init_cash = bt.cash_series.iloc[0]
-    alloc = init_cash / len(tickers)
-    shares = alloc / price.iloc[0]
-    eq_val = (shares * price).sum(axis=1)
+    first_prices = test_prices.iloc[0]
+    per_asset_cash = init_cash / len(tickers)
+    shares = per_asset_cash / first_prices
+    eq_val = (shares * test_prices).sum(axis=1)
+    eq_rets = eq_val.pct_change().fillna(0)
     eq_stats = {
-        'Total Return': eq_val.iloc[-1]/eq_val.iloc[0] - 1,
-        'Sharpe': eq_val.pct_change().mean()/eq_val.pct_change().std() * np.sqrt(252)
+        'Total Return': eq_val.iloc[-1] / eq_val.iloc[0] - 1,
+        'Sharpe': eq_rets.mean() / eq_rets.std() * np.sqrt(252)
     }
 
-    # 6) Plot performance
-    plt.figure(figsize=(10,6))
+    # ─── 7) Print Sharpe & Improvement ─────────────────────────────────────────
+    print(f"Stat-Arb Sharpe:   {strat_stats['Sharpe']:.2f}")
+    print(f"Equal-Wt Sharpe:   {eq_stats['Sharpe']:.2f}")
+    print("Sharpe Improvement: {:.2f}".format(
+        strat_stats['Sharpe'] - eq_stats['Sharpe']
+    ))
+
+    # ─── 8) Equity Curves ───────────────────────────────────────────────────────
+    plt.figure(figsize=(10, 5))
     strat_df['PortfolioValue'].plot(label='Enhanced Stat-Arb')
     eq_val.plot(label='Equal-Weight')
-    plt.title('Strategy vs Benchmark')
-    plt.xlabel('Date')
+    plt.title(f'Equity Curves (Test from {split_date.date()})')
+    plt.xlabel('Date');
     plt.ylabel('Portfolio Value')
-    plt.legend()
-    plt.tight_layout()
+    plt.legend();
+    plt.tight_layout();
     plt.show()
 
-    # 7) Compute equal‐weight returns series
-    eq_returns = eq_val.pct_change().fillna(0)
-
-    # 8) Bar‐chart comparison of Total Return & Sharpe
-    import matplotlib.pyplot as plt
-    metrics = pd.DataFrame({
+    # ─── 9) Bar Charts: Total Return & Sharpe ──────────────────────────────────
+    perf_df = pd.DataFrame({
         'Enhanced Stat-Arb': [strat_stats['Total Return'], strat_stats['Sharpe']],
-        'Equal-Weight'    : [       eq_stats['Total Return'],        eq_stats['Sharpe']]
+        'Equal-Weight': [eq_stats['Total Return'], eq_stats['Sharpe']]
     }, index=['Total Return', 'Sharpe'])
-    # transpose so each strategy is a group
-    metrics.T.plot(kind='bar', subplots=True,
-                   layout=(1,2), figsize=(12,4),
-                   title=['Total Return','Sharpe Ratio'], legend=False)
-    plt.tight_layout()
-    plt.show()
-
-
-    # 9) 60-day rolling Sharpe ratio
-    rolling_window = 60
-    roll_sharpe_strat = (
-        strat_df['Returns']
-        .rolling(rolling_window)
-        .mean() /
-        strat_df['Returns']
-        .rolling(rolling_window)
-        .std()
-    ) * np.sqrt(252)
-    roll_sharpe_eq = (
-        eq_returns
-        .rolling(rolling_window)
-        .mean() /
-        eq_returns
-        .rolling(rolling_window)
-        .std()
-    ) * np.sqrt(252)
-
-    plt.figure(figsize=(10,5))
-    roll_sharpe_strat.plot(label='Stat-Arb Rolling Sharpe')
-    roll_sharpe_eq.plot(label='Equal-Weight Rolling Sharpe')
-    plt.axhline(0, color='black', lw=0.5)
-    plt.title(f'{rolling_window}-Day Rolling Sharpe Ratio')
-    plt.xlabel('Date')
-    plt.ylabel('Sharpe')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    # 10) Distribution of daily returns
-    plt.figure(figsize=(10,5))
-    strat_df['Returns'].hist(bins=50, alpha=0.6, label='Stat-Arb')
-    eq_returns.hist(bins=50, alpha=0.4, label='Equal-Weight')
-    plt.title('Histogram of Daily Returns')
-    plt.xlabel('Daily Return')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.tight_layout()
+    perf_df.T.plot(kind='bar', subplots=True, layout=(1, 2), figsize=(12, 4), legend=False, title=['Total Return', 'Sharpe Ratio'])
+    plt.tight_layout();
     plt.show()
